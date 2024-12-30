@@ -1,22 +1,32 @@
+#include <asm-generic/socket.h>
+#include <bits/types/struct_timeval.h>
 #include <sys/socket.h> // FOR SOCKET RELATED FUNCTIONS
 #include <netinet/in.h> // FOR SOCKET ADDRESS
+#include <netinet/tcp.h> // TCP STUFF
 #include <sys/stat.h>   // FOR FILE INFORMATION
 #include <dirent.h>     // FOR READING DIRECTORY CONTENTS
 #include <stdlib.h>     // FOR HANDLING MEMORY AND OTHER STUFF
 #include <string.h>     // FOR STRING MANIPULATION
+#include <sys/types.h>
 #include <unistd.h>     // FOR HANDLING OF FILE AND PROCESS
 #include <stdio.h>      // FOR PRINTING ERRORS WITH perror()
 #include <ctype.h>      // FOR STRING AND CHARACTER MANIPULATION
+#include <errno.h>
 
 #define CONTROL_PORT 21 // FTP PORT
 #define SIZE 1024 // SIZE OF THE BUFFER
+#define FILE_SIZE 16384
+#define TYPE_I 1
+#define TYPE_A 0
 
 // INFORMATION OF THE CLIENT
 typedef struct  {
-    int control_socket;
-    int data_socket;
-    char username[64];
     int is_authenticated;
+    int control_socket;
+    int transfer_type;
+    int data_socket;
+    char current_dir[SIZE];
+    char username[64];
 } client_info;
 
 // THIS FUNCTION TRIM THE STRING PASSED THROUGH THE STR POINTER
@@ -134,6 +144,180 @@ int create_pasv_socket(client_info *client)
     return server_fd;
 }
 
+void handle_type(client_info *client, char *arg)
+{
+    if (arg[0] == 'I' || arg[0] == 'i') {
+        client->transfer_type = TYPE_I;
+        write(client->control_socket, "200 Type set to I\r\n", 19);
+    } else if (arg[0] == 'A' || arg[0] == 'a') {
+        client->transfer_type = TYPE_A;
+        write(client->control_socket, "200 Type set to A\r\n", 19);
+    } else {
+        write(client->control_socket, "504 Unknown type\r\n", 18);
+    }
+}
+
+void handle_retr(client_info *client, char *filename)
+{
+    FILE *file = NULL;
+    unsigned char *buffer = NULL;
+    int data_client = -1;
+    size_t bytes_read;
+    ssize_t bytes_written;
+    off_t file_size = 0;
+    off_t total_sent = 0;
+    char *file_ext;
+    struct stat file_info;
+
+    if (!client || !filename) {
+        const char *err = "501 Syntax error in parameters or arguments\r\n";
+        write(client->control_socket, err, strlen(err));
+        return;
+    }
+
+    if (client->data_socket == -1) {
+        const char *msg = "425 Use PASV or PORT first\r\n";
+        write(client->control_socket, msg, strlen(msg));
+        return;
+    }
+
+    file_ext = strrchr(filename, '.');
+    int is_binary = 0;
+
+    if (file_ext) {
+        const char *binary_extensions[] = {
+            ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip",
+            ".exe", ".bin", ".iso", ".tar", ".gz", ".mp3",
+            ".mp4", ".avi", ".mov", NULL
+        };
+
+        for (const char **ext = binary_extensions; *ext; ext++) {
+            if (strcasecmp(file_ext, *ext) == 0) {
+                is_binary = 1;
+                break;
+            }
+        }
+    }
+
+    if (is_binary && client->transfer_type != TYPE_I) {
+        const char *type_msg = "200 Switching to Binary mode for binary file\r\n";
+        write(client->control_socket, type_msg, strlen(type_msg));
+        client->transfer_type = TYPE_I;
+    } 
+
+    // Get file information
+    if (stat(filename, &file_info) == 0) {
+        file_size = file_info.st_size;
+    } else {
+        const char *err = "550 Could not get file information\r\n";
+        write(client->control_socket, err, strlen(err));
+        return;
+    }
+
+    // OPEN THE FILE IN READ AND BINARY MODE
+    file = fopen(filename, "rb");
+    if (!file) {
+        const char *err = "505 Requested action not taken. File unavailable\r\n";
+        write(client->control_socket, err, strlen(err));
+        free(buffer);
+        return;
+    }
+
+    buffer = malloc(FILE_SIZE);
+    if (!buffer) {
+        const char *err = "551 Local erro: could not allocate memory\r\n";
+        write(client->control_socket, err, strlen(err));
+        return;
+    }
+
+    char response[256];
+    snprintf(response, sizeof(response), "150 Opening connnection for %s (%ld bytes)\r\n", filename, (long)file_size);
+    if (write(client->control_socket, response, strlen(response)) == -1) {
+        fclose(file);
+        perror("Write failed in RETR");
+        return;
+    }
+
+    data_client = accept(client->data_socket, NULL, NULL);
+    if (data_client < 0) {
+        const char *err = "425 Can't open data connection\r\n";
+        write(client->control_socket, err, strlen(err));
+        fclose(file);
+        return;
+    }
+
+    if (client->transfer_type == TYPE_I) {
+        int flag = 1;
+        setsockopt(data_client, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    }
+
+    while ((bytes_read = fread(buffer, 1, FILE_SIZE, file)) > 0) {
+        size_t bytes_remaining = bytes_read;
+        size_t bytes_sent = 0;
+
+        while (bytes_remaining > 0) {
+            bytes_written = write(data_client, buffer + bytes_sent, bytes_remaining);
+
+            if (bytes_written < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                perror("Data transfer failed");
+                break;
+            }
+
+            bytes_remaining -= bytes_written;
+            bytes_sent += bytes_written;
+            total_sent += bytes_written;
+        }
+    }
+
+    if (total_sent == file_size) {
+        snprintf(response, sizeof(response), 
+        "226 Transfer complete. %ld bytes transferred\r\n", 
+        (long)total_sent);
+    } else {
+        snprintf(response, sizeof(response), 
+        "551 Transfer incomplete. Only %ld of %ld bytes transferred\r\n", 
+        (long)total_sent, (long)file_size);
+    }
+
+    write(client->control_socket, response, strlen(response));
+
+    free(buffer);
+    fclose(file);
+    close(data_client);
+    close(client->data_socket);
+    client->data_socket = -1;
+}
+
+void handle_pwd(client_info *client)
+{
+    char response[SIZE+256];
+    snprintf(response, sizeof(response), "257 \"%s\" is current directory\r\n", client->current_dir);
+    write(client->control_socket, response, strlen(response));
+}
+
+void handle_cwd(client_info *client, const char *path)
+{
+    char new_path[SIZE+256];
+
+    if (path[0] == '/') {
+        strncpy(new_path, path, sizeof(new_path) - 1);
+    } else {
+        snprintf(new_path, sizeof(new_path), "%s/%s", client->current_dir, path);
+    }
+
+    if (chdir(new_path) == 0) {
+        getcwd(client->current_dir, sizeof(client->current_dir));
+        const char *response = "250 Directory sucessfully changed\r\n";
+        write(client->control_socket, response, strlen(response));
+    } else {
+        const char *response = "550 Failed to change directory\r\n";
+        write(client->control_socket, response, strlen(response));
+    }
+}
+
 void handle_list(client_info *client)
 {
     // CREATE A NEW VARIABLE FOR THE DIRECTORY
@@ -167,10 +351,11 @@ void handle_list(client_info *client)
     }
 
     // HERE YOU PUT YOUR REMOTE DIRECTORY
-    dir = opendir("/home/marco/");
+    dir = opendir(client->current_dir);
     if (dir == NULL) {
         const char *err = "450 Requested file action not taken\r\n";
         write(client->control_socket, err, strlen(err));
+        closedir(dir);
         close(data_client);
         return;
     }
@@ -196,6 +381,7 @@ void handle_list(client_info *client)
                 entry->d_name);
 
         if (write(data_client, data_buffer, strlen(data_buffer)) == -1) {
+            closedir(dir);
             perror("Write failed while reading the directory");
             exit(1);
         }
@@ -206,7 +392,7 @@ void handle_list(client_info *client)
     close(client->data_socket);
     client->data_socket = -1;
 
-    response = "Closing data connection. Requested file action successful\r\n";
+    response = "226 Closing data connection. Requested file action successful\r\n";
     if (write(client->control_socket, response, strlen(response)) == -1) {
         perror("Write failed while closing the connection");
         exit(1);
@@ -249,6 +435,12 @@ void handle_command(client_info *client, char *buffer)
         write(client->control_socket, response, strlen(response));
     } else if (strcmp(command, "LIST") == 0) {
         handle_list(client);
+    } else if (strcmp(command, "CWD") == 0) {
+        handle_cwd(client, arg);
+    } else if (strcmp(command, "PWD") == 0) {
+        handle_pwd(client);
+    } else if (strcmp(command, "TYPE") == 0) {
+        handle_type(client, arg);
     } else if (strcmp(command, "PASV") == 0) {
         int pasv_sock = create_pasv_socket(client);
         if(pasv_sock < 0) {
@@ -256,6 +448,8 @@ void handle_command(client_info *client, char *buffer)
             write(client->control_socket, pasv_err, strlen(pasv_err));
         }
         client->data_socket = pasv_sock;
+    } else if (strcmp(command, "RETR") == 0) {
+        handle_retr(client, arg);
     } else if (strcmp(command, "QUIT") == 0) {
         handle_quit(client);
     } else {
@@ -311,9 +505,16 @@ int main()
         // CREATE A NEW CLIENT AND INITIALIZE IT
         client_info client = {
             .control_socket = client_socket,
-            .data_socket = 1,
+            .data_socket = -1,
             .is_authenticated = 0
         };
+
+        // CHECK IF CURRENT_DIR IS EMPTY
+        if (getcwd(client.current_dir, sizeof(client.current_dir)) == NULL) {
+            perror("Could not get workin directory");
+            // USE THAT DIRECTORY AS DEFAULT
+            strcpy(client.current_dir,"/home/marco/");
+        }
 
         const char *welcome = "220 Service ready for new user.\r\n";
         if (write(client_socket, welcome, strlen(welcome)) == -1) {
