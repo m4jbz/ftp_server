@@ -7,10 +7,10 @@ Simple FTP server, both written in C.
 **Can**:
 + Log in with a USER and PASSword given at their related functions.
 + LIST all files in the directory given at line 170.
++ GET files from the server.
 + EXIT from the server.
 
 **Can NOT**:
-+ GET files from the server.
 + PUT, upload files to the server.
 + Handle more than one connection at a time.
 

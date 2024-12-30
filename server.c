@@ -1,32 +1,31 @@
-#include <asm-generic/socket.h>
-#include <bits/types/struct_timeval.h>
-#include <sys/socket.h> // FOR SOCKET RELATED FUNCTIONS
-#include <netinet/in.h> // FOR SOCKET ADDRESS
-#include <netinet/tcp.h> // TCP STUFF
-#include <sys/stat.h>   // FOR FILE INFORMATION
-#include <dirent.h>     // FOR READING DIRECTORY CONTENTS
-#include <stdlib.h>     // FOR HANDLING MEMORY AND OTHER STUFF
-#include <string.h>     // FOR STRING MANIPULATION
-#include <sys/types.h>
-#include <unistd.h>     // FOR HANDLING OF FILE AND PROCESS
-#include <stdio.h>      // FOR PRINTING ERRORS WITH perror()
-#include <ctype.h>      // FOR STRING AND CHARACTER MANIPULATION
-#include <errno.h>
+#include <sys/socket.h>  // FOR SOCKET RELATED FUNCTIONS
+#include <netinet/in.h>  // FOR SOCKET ADDRESS
+#include <netinet/tcp.h> // TCP SOCKET OPTIONS
+#include <sys/stat.h>    // FOR FILE INFORMATION
+#include <dirent.h>      // FOR READING DIRECTORY CONTENTS
+#include <stdlib.h>      // FOR HANDLING MEMORY AND OTHER STUFF
+#include <string.h>      // FOR STRING MANIPULATION
+#include <unistd.h>      // FOR HANDLING OF FILE AND PROCESS
+#include <stdio.h>       // FOR PRINTING ERRORS WITH perror()
+#include <ctype.h>       // FOR STRING AND CHARACTER MANIPULATION
+#include <errno.h>       // MACROS FOR ERROR REPORTING
 
 #define CONTROL_PORT 21 // FTP PORT
 #define SIZE 1024 // SIZE OF THE BUFFER
-#define FILE_SIZE 16384
+#define FILE_SIZE 16384 // SIZE FOR FILE BUFFERS
+
+// TYPE ASCII AND BINARY
 #define TYPE_I 1
 #define TYPE_A 0
 
 // INFORMATION OF THE CLIENT
 typedef struct  {
-    int is_authenticated;
-    int control_socket;
-    int transfer_type;
-    int data_socket;
-    char current_dir[SIZE];
-    char username[64];
+    int is_authenticated;   // FOR CHECKING CREDENTIALS
+    int control_socket;     // "MAIN" SOCKET WHERE ALL WRITE CALLS GOES 
+    int transfer_type;      // IT CAN BE ASCII OR BINARY
+    int data_socket;        // DATA TRANSFER SOCKET 
+    char current_dir[SIZE]; // CURRENT REMOTE DIRECTORY
+    char username[64];      // FOR CHECKING USERNAME
 } client_info;
 
 // THIS FUNCTION TRIM THE STRING PASSED THROUGH THE STR POINTER
@@ -146,9 +145,11 @@ int create_pasv_socket(client_info *client)
 
 void handle_type(client_info *client, char *arg)
 {
+    // BINARY
     if (arg[0] == 'I' || arg[0] == 'i') {
         client->transfer_type = TYPE_I;
         write(client->control_socket, "200 Type set to I\r\n", 19);
+    // ASCII
     } else if (arg[0] == 'A' || arg[0] == 'a') {
         client->transfer_type = TYPE_A;
         write(client->control_socket, "200 Type set to A\r\n", 19);
@@ -161,29 +162,34 @@ void handle_retr(client_info *client, char *filename)
 {
     FILE *file = NULL;
     unsigned char *buffer = NULL;
-    int data_client = -1;
+    int data_client = -1; // INIT SOCKET
     size_t bytes_read;
     ssize_t bytes_written;
     off_t file_size = 0;
     off_t total_sent = 0;
-    char *file_ext;
-    struct stat file_info;
+    char *file_ext; // FILE EXTENSION
+    struct stat file_info; // FILE INFORMATION
 
+    // CHECKS IF THE ARGS ARE CORRECT
     if (!client || !filename) {
         const char *err = "501 Syntax error in parameters or arguments\r\n";
         write(client->control_socket, err, strlen(err));
         return;
     }
 
+    // CHECK IF WE HAVE A SOCKET FOR PASV
     if (client->data_socket == -1) {
         const char *msg = "425 Use PASV or PORT first\r\n";
         write(client->control_socket, msg, strlen(msg));
         return;
     }
 
+    // GET THE FILE EXTENSION
     file_ext = strrchr(filename, '.');
     int is_binary = 0;
 
+    // GOES THROUGH EVERY SINGLE BINARY EXTENSION (INSIDE OF THE BINARY_EXTENSION)
+    // ARRAY, AND IF IT MATCHES ONE OF THEM THE IS_BINARY VARIABLES BECOMES TRUE
     if (file_ext) {
         const char *binary_extensions[] = {
             ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip",
@@ -199,13 +205,14 @@ void handle_retr(client_info *client, char *filename)
         }
     }
 
+    // SEND A MESSAGE THAT THE TYPE IS BINARY
     if (is_binary && client->transfer_type != TYPE_I) {
         const char *type_msg = "200 Switching to Binary mode for binary file\r\n";
         write(client->control_socket, type_msg, strlen(type_msg));
         client->transfer_type = TYPE_I;
     } 
 
-    // Get file information
+    // GET FILE INFORMATION
     if (stat(filename, &file_info) == 0) {
         file_size = file_info.st_size;
     } else {
@@ -223,6 +230,7 @@ void handle_retr(client_info *client, char *filename)
         return;
     }
 
+    // ALLOCATE MEMORY FOR THE BUFFER
     buffer = malloc(FILE_SIZE);
     if (!buffer) {
         const char *err = "551 Local erro: could not allocate memory\r\n";
@@ -246,11 +254,15 @@ void handle_retr(client_info *client, char *filename)
         return;
     }
 
+    // THIS ONLY ACTIVATES WHEN IT IS WORKING WITH BINARY FILES
     if (client->transfer_type == TYPE_I) {
         int flag = 1;
+        // DEACTIVATE NAGLE'S ALGORTIHM, FOR SENDING DATA IMMEDIATELY
         setsockopt(data_client, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
     }
 
+    // READ EVERY SINGLE BYTE AND WRITES IT, OR BASICALLY TRANSFERS
+    // THE DATA FROM THE REMOTE FILE
     while ((bytes_read = fread(buffer, 1, FILE_SIZE, file)) > 0) {
         size_t bytes_remaining = bytes_read;
         size_t bytes_sent = 0;
@@ -258,10 +270,14 @@ void handle_retr(client_info *client, char *filename)
         while (bytes_remaining > 0) {
             bytes_written = write(data_client, buffer + bytes_sent, bytes_remaining);
 
+            // CHECKS IF WRITE WORKED
             if (bytes_written < 0) {
+                // THIS IS HANDLING PREMATURE ERRORS THAT NOT NECESSARILY MEAN
+                // A PERMANENT ERROR
                 if (errno == EINTR) {
                     continue;
                 }
+
                 perror("Data transfer failed");
                 break;
             }
@@ -284,6 +300,7 @@ void handle_retr(client_info *client, char *filename)
 
     write(client->control_socket, response, strlen(response));
 
+    // CLEAN EVERYTHING
     free(buffer);
     fclose(file);
     close(data_client);
@@ -302,13 +319,16 @@ void handle_cwd(client_info *client, const char *path)
 {
     char new_path[SIZE+256];
 
+    // CHECKS IF THE PATH IS CORRECT, IF IT HAS / AT THE BEGGINING
+    // IF NOT IT IS PUT ON
     if (path[0] == '/') {
         strncpy(new_path, path, sizeof(new_path) - 1);
     } else {
         snprintf(new_path, sizeof(new_path), "%s/%s", client->current_dir, path);
     }
 
-    if (chdir(new_path) == 0) {
+    // CHECK IF THE CHANGE SUCCESSED OR NOT
+    if (chdir(new_path) == 0) { // CHDIR RETURNS 0 IF THE CHANGE WAS A SUCCESS
         getcwd(client->current_dir, sizeof(client->current_dir));
         const char *response = "250 Directory sucessfully changed\r\n";
         write(client->control_socket, response, strlen(response));
