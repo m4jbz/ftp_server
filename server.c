@@ -1,18 +1,17 @@
-#include <asm-generic/socket.h>
-#include <stdio.h>
-#include <sys/socket.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <netinet/in.h>
-#include <ctype.h>
-#include <dirent.h>     // FOR READING DIRECTORY CONTENTS
+#include <sys/socket.h> // FOR SOCKET RELATED FUNCTIONS
+#include <netinet/in.h> // FOR SOCKET ADDRESS
 #include <sys/stat.h>   // FOR FILE INFORMATION
+#include <dirent.h>     // FOR READING DIRECTORY CONTENTS
+#include <stdlib.h>     // FOR HANDLING MEMORY AND OTHER STUFF
+#include <string.h>     // FOR STRING MANIPULATION
+#include <unistd.h>     // FOR HANDLING OF FILE AND PROCESS
+#include <stdio.h>      // FOR PRINTING ERRORS WITH perror()
+#include <ctype.h>      // FOR STRING AND CHARACTER MANIPULATION
 
-#define CONTROL_PORT 21
-#define DATA_PORT 20
-#define SIZE 1024
+#define CONTROL_PORT 21 // FTP PORT
+#define SIZE 1024 // SIZE OF THE BUFFER
 
+// INFORMATION OF THE CLIENT
 typedef struct  {
     int control_socket;
     int data_socket;
@@ -59,8 +58,8 @@ void handle_user(client_info *client, const char *username)
         return;
     }
 
-    // COPY THE USERNAME CONTENT INTO CLIENT->USERNAME VARIABLE, THE -1
-    // AT THE END IS FOR THE \'0' CHARACTER
+    // COPY THE USERNAME CONTENT INTO CLIENT->USERNAME VARIABLE,
+    // THE -1 AT THE END IS FOR THE \'0' CHARACTER
     stpncpy(client->username, username, sizeof(client->username) - 1);
     const char* response = "331 Username OK, password needed\r\n";
     // SENT THE RESPONSE
@@ -83,8 +82,11 @@ void handle_password(client_info *client, const char *password)
     write(client->control_socket, response, strlen(response));
 }
 
+// HANDLES THE PASV COMMAND, THIS IS NEEDED SO
+// WE DON'T GET ANY PROBLEMS WITH THE FIREWALL OF THE SYSTEM
 int create_pasv_socket(client_info *client)
 {
+    // CREATE SOCKET AND ADDRESS
     int server_fd;
     struct sockaddr_in addr;
     socklen_t addr_len = sizeof(addr);
@@ -97,6 +99,7 @@ int create_pasv_socket(client_info *client)
 
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
+    // LET THE SYSTEM TO CHOOSE THE PORT
     addr.sin_port = 0;
 
     if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
@@ -111,27 +114,34 @@ int create_pasv_socket(client_info *client)
         exit(1);
     }
 
+    // GET THE PORT
     if (getsockname(server_fd, (struct sockaddr *)&addr, &addr_len) < 0) {
         perror("getsockname failed");
         close(server_fd);
         return -1;
     }
-
     int port = ntohs(addr.sin_port);
+
     char response[128];
     snprintf(response, sizeof(response), "227 Entering Passive Mode (127,0,0,1,%d,%d)\r\n", port / 256, port % 256);
 
-    write(client->control_socket, response, strlen(response));
+    if (write(client->control_socket, response, strlen(response)) == -1) {
+        perror("Write failed in PASV");
+        close(server_fd);
+        exit(1);
+    }
 
     return server_fd;
 }
 
 void handle_list(client_info *client)
 {
+    // CREATE A NEW VARIABLE FOR THE DIRECTORY
     DIR *dir;
     struct dirent *entry;
     char data_buffer[SIZE];
     
+    // CHECK IF WE HAVE A SOCKET FOR PASV
     if (client->data_socket == -1) {
         const char *response = "425 Use PASV or PORT first\r\n";
         write(client->control_socket, response, strlen(response));
@@ -139,9 +149,16 @@ void handle_list(client_info *client)
     }
     
     const char *response = "150 File status okay; about to open data connection.\r\n";
-    write(client->control_socket, response, strlen(response));
+    if (write(client->control_socket, response, strlen(response)) == -1) {
+        perror("Write failed in LIST");
+        exit(1);
+    }
 
-    int data_client = accept(client->data_socket, NULL, NULL);
+    // ACCEPT THE CLIENT CONNECTION ON THE PASSIVE SOCKET
+    // IT WILL WAIT UNTIL THE USER ATTEMPT TO CONNECT
+    int data_client = accept(client->data_socket, NULL, NULL); 
+    // USES NULL BECAUSE THE ADDRESS
+    // INFORMATION IS NOT IMPORTANT HERE
     if (data_client < 0) {
         perror("Accept failed in LIST");
         close(client->data_socket);
@@ -149,7 +166,8 @@ void handle_list(client_info *client)
         return;
     }
 
-    dir = opendir(".");
+    // HERE YOU PUT YOUR REMOTE DIRECTORY
+    dir = opendir("/home/marco/");
     if (dir == NULL) {
         const char *err = "450 Requested file action not taken\r\n";
         write(client->control_socket, err, strlen(err));
@@ -157,11 +175,12 @@ void handle_list(client_info *client)
         return;
     }
 
+    // READ ALL ENTRIES IN THE DIRECTORY
     while ((entry = readdir(dir)) != NULL) {
         struct stat file_stat;
         stat(entry->d_name, &file_stat);
 
-        // Format: "permissions size name\r\n"
+        // FORMAT: "PERMISSIONS SIZE NAME\R\N"
         snprintf(data_buffer, SIZE, "%c%c%c%c%c%c%c%c%c%c %8ld %s\r\n",
                 (S_ISDIR(file_stat.st_mode)) ? 'd' : '-',
                 (file_stat.st_mode & S_IRUSR) ? 'r' : '-',
@@ -176,7 +195,10 @@ void handle_list(client_info *client)
                 file_stat.st_size,
                 entry->d_name);
 
-        write(data_client, data_buffer, strlen(data_buffer));
+        if (write(data_client, data_buffer, strlen(data_buffer)) == -1) {
+            perror("Write failed while reading the directory");
+            exit(1);
+        }
     }
 
     closedir(dir);
@@ -185,25 +207,35 @@ void handle_list(client_info *client)
     client->data_socket = -1;
 
     response = "Closing data connection. Requested file action successful\r\n";
-    write(client->control_socket, response, strlen(response));
+    if (write(client->control_socket, response, strlen(response)) == -1) {
+        perror("Write failed while closing the connection");
+        exit(1);
+    }
 } 
 
+// THIS HANDLES EACH FTP COMMAND THAT WE ADD
+// BY NOW IT KINDA SUCKS THE WAY THAT I'M HANDLING
+// THIS BUT I'M GOING TO CHANGE IT
 void handle_command(client_info *client, char *buffer)
 {
+    // SEPARATE THE BUFFER INTO THE 
+    // ACTUAL COMMAND AND THE ARGUMENTS
     char command[32] = {0};
     char arg[SIZE] = {0};
 
-    // IT CUT THE BUFFER SO IT HAS NO SPACES CHARACTERS
+    // CUT THE BUFFER SO IT HAS NO SPACES CHARACTERS
     trim(buffer);
-    // AND THEN IT GIVES HIM A NEW FORMAT
+    // GIVE IT A NEW FORMAT
     sscanf(buffer, "%s %s", command, arg);
 
     printf("Received command: %s, arg: %s\n", command, arg);
 
+    // MAKE ALL COMMANDS UPPERCASE
     for (int i = 0; command[i]; i++) {
         command[i] = toupper(command[i]);
     }
 
+    // UGLY ASS HANDLING I KNOW
     if (strcmp(command, "USER") == 0) {
         handle_user(client, arg);
     } else if (strcmp(command, "PASS") == 0) {
@@ -212,6 +244,7 @@ void handle_command(client_info *client, char *buffer)
         const char *response = "Not logged in\r\n";
         write(client->control_socket, response, strlen(response));
     } else if(strcmp(command, "SYST") == 0) {
+        // THIS IS NECESSARY FOR CURRENT FTP CLIENTS
         const char *response = "215 UNIX Type: L8\r\n";
         write(client->control_socket, response, strlen(response));
     } else if (strcmp(command, "LIST") == 0) {
@@ -233,6 +266,7 @@ void handle_command(client_info *client, char *buffer)
 
 int main()
 {
+    // CREATE SOCKET
     int server_fd;
     struct sockaddr_in address;
     int addr_len = sizeof(address);
@@ -243,15 +277,17 @@ int main()
         exit(1);
     }
 
+    // SET SOCKET OPTIONS (ALLOW REUSE OF ADDRESS)
     int opt = 1;
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
         perror("setsockopt() failed");
         exit(1);
     }
 
+    // CREATE ADDRESS
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(CONTROL_PORT);
+    address.sin_port = htons(CONTROL_PORT); // IT USES PORT 21
 
     if (bind(server_fd, (struct sockaddr *)&address, addr_len) < 0) {
         perror("Bind failed in MAIN");
@@ -259,7 +295,7 @@ int main()
     }
 
     if (listen(server_fd, 10) < 0) {
-        perror("Listen failed");
+        perror("Listen failed in MAIN");
         exit(1);
     }
 
@@ -267,31 +303,39 @@ int main()
 
     while (1) {
         int client_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t *)&addr_len);
-
         if (client_socket < 0) {
-            perror("Accept failed");
+            perror("Accept failed in MAIN");
             continue;
         }
     
+        // CREATE A NEW CLIENT AND INITIALIZE IT
         client_info client = {
             .control_socket = client_socket,
+            .data_socket = 1,
             .is_authenticated = 0
         };
 
         const char *welcome = "220 Service ready for new user.\r\n";
-        write(client_socket, welcome, strlen(welcome));
+        if (write(client_socket, welcome, strlen(welcome)) == -1) {
+            perror("Write failed in MAIN");
+            exit(1);
+        }
 
         char buffer[SIZE];
 
         while (1) {
+            // INITIATE THE BUFFER WITH 0
             memset(buffer, 0, SIZE);
+            // READ AND STORE THE CLIENT INPUT IN BYTES
             int read_size = read(client_socket, buffer, SIZE - 1);
 
+            // CHECK IF AN ERROR HAS OCURRED OR THE CLIENT HAS LEFT THE SERVER
             if (read_size < 0) {
                 printf("Client disconnected\n");
                 break;
             }
 
+            // HANDLE THE INPUT (BUFFER)
             handle_command(&client, buffer);
         }
 
