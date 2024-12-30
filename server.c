@@ -10,15 +10,15 @@
 #include <sys/stat.h>   // FOR FILE INFORMATION
 
 #define CONTROL_PORT 21
+#define DATA_PORT 20
 #define SIZE 1024
 
-struct client_info {
+typedef struct  {
     int control_socket;
     int data_socket;
     char username[64];
     int is_authenticated;
-    char current_dir[SIZE];
-};
+} client_info;
 
 // THIS FUNCTION TRIM THE STRING PASSED THROUGH THE STR POINTER
 void trim(char *str)
@@ -38,10 +38,21 @@ void trim(char *str)
     *(end + 1) = '\0';
 }
 
-void handle_user(struct client_info *client, const char *username)
+void handle_quit(client_info *client)
+{
+    const char *response = "221 Goodbye\r\n"; 
+    write(client->control_socket, response, strlen(response));
+
+    if (close(client->control_socket) < 0) {
+        perror("Close failed");
+        exit(1);
+    }
+} 
+
+void handle_user(client_info *client, const char *username)
 {
     // CHECK CREDENTIALS
-    if (strcmp(username, "marco") != 0) {
+    if (strcmp(username, "admin") != 0) {
         const char *response = "430 Invalid username\r\n";
         write(client->control_socket, response, strlen(response));
 
@@ -56,10 +67,10 @@ void handle_user(struct client_info *client, const char *username)
     write(client->control_socket, response, strlen(response));
 }
 
-void handle_password(struct client_info *client, const char *password)
+void handle_password(client_info *client, const char *password)
 {
     // CHECK CREDENTIALS
-    if (strcmp(password, "2005") != 0) {
+    if (strcmp(password, "admin") != 0) {
         const char *response = "430 Invalid password\r\n";
         write(client->control_socket, response, strlen(response));
 
@@ -72,76 +83,70 @@ void handle_password(struct client_info *client, const char *password)
     write(client->control_socket, response, strlen(response));
 }
 
-int create_passive_socket(struct client_info *client)
+int create_pasv_socket(client_info *client)
 {
-    int passive_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (passive_sock < 0) {
+    int server_fd;
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (server_fd == 0) {
         perror("Socket failed");
         exit(1);
     }
 
-    struct sockaddr_in pasv_addr = {0};
-    pasv_addr.sin_family = AF_INET;
-    pasv_addr.sin_addr.s_addr = INADDR_ANY;
-    pasv_addr.sin_port = 0;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = 0;
 
-    if (bind(passive_sock, (struct sockaddr*)&pasv_addr, sizeof(pasv_addr)) < 0) {
-        close(passive_sock);
-        perror("Bind failed");
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("Bind failed in PASV");
+        close(server_fd);
         exit(1);
     }
 
-    if (listen(passive_sock, 1) < 0) {
-        close(passive_sock);
+    if (listen(server_fd, 1) < 0) {
         perror("Listen failed");
+        close(server_fd);
         exit(1);
     }
 
-
-    struct sockaddr_in addr;
-    socklen_t addr_len = sizeof(addr);
-
-    if (getsockname(passive_sock, (struct sockaddr*)&addr, &addr_len) < 0) {
-        close(passive_sock);
+    if (getsockname(server_fd, (struct sockaddr *)&addr, &addr_len) < 0) {
         perror("getsockname failed");
-        exit(1);
+        close(server_fd);
+        return -1;
     }
 
     int port = ntohs(addr.sin_port);
-    int p1 = port >> 8;
-    int p2 = port & 0xFF;
+    char response[128];
+    snprintf(response, sizeof(response), "227 Entering Passive Mode (127,0,0,1,%d,%d)\r\n", port / 256, port % 256);
 
-    char response[100];
-    sprintf(response, "227 Entering Passive Mode (127,0,0,1,%d,%d)\r\n", p1, p2);
     write(client->control_socket, response, strlen(response));
 
-    return passive_sock;
+    return server_fd;
 }
 
-void handle_list(struct client_info *client)
+void handle_list(client_info *client)
 {
     DIR *dir;
     struct dirent *entry;
     char data_buffer[SIZE];
-
-    int passive_sock = create_passive_socket(client);
-    if (passive_sock < 0) {
-        const char *err = "425 Can't open data connection\r\n";
-        write(client->control_socket, err, strlen(err));
+    
+    if (client->data_socket == -1) {
+        const char *response = "425 Use PASV or PORT first\r\n";
+        write(client->control_socket, response, strlen(response));
         return;
     }
     
     const char *response = "150 File status okay; about to open data connection.\r\n";
     write(client->control_socket, response, strlen(response));
 
-    const char *ready = "PORT 2121\r\n";
-    write(client->control_socket, ready, strlen(ready));
-    
-    int data_client = accept(passive_sock, NULL, NULL);
-
+    int data_client = accept(client->data_socket, NULL, NULL);
     if (data_client < 0) {
-        perror("Accept failed");
-        exit(1);
+        perror("Accept failed in LIST");
+        close(client->data_socket);
+        client->data_socket = -1;
+        return;
     }
 
     dir = opendir(".");
@@ -149,7 +154,6 @@ void handle_list(struct client_info *client)
         const char *err = "450 Requested file action not taken\r\n";
         write(client->control_socket, err, strlen(err));
         close(data_client);
-        close(passive_sock);
         return;
     }
 
@@ -177,13 +181,14 @@ void handle_list(struct client_info *client)
 
     closedir(dir);
     close(data_client);
-    close(passive_sock);
+    close(client->data_socket);
+    client->data_socket = -1;
 
-    response = "226 Closing data connection. Requested file action successful\r\n";
+    response = "Closing data connection. Requested file action successful\r\n";
     write(client->control_socket, response, strlen(response));
 } 
 
-void handle_command(struct client_info *client, char *buffer)
+void handle_command(client_info *client, char *buffer)
 {
     char command[32] = {0};
     char arg[SIZE] = {0};
@@ -209,15 +214,17 @@ void handle_command(struct client_info *client, char *buffer)
     } else if(strcmp(command, "SYST") == 0) {
         const char *response = "215 UNIX Type: L8\r\n";
         write(client->control_socket, response, strlen(response));
-    } else if (strcmp(command, "PASV") == 0) {
-        int passive_sock = create_passive_socket(client);
-        if (passive_sock < 0) {
-            const char *err = "425 Can't open data connection.\r\n";
-            write(client->control_socket, err, strlen(err));
-        }
-        client->data_socket = passive_sock;
     } else if (strcmp(command, "LIST") == 0) {
         handle_list(client);
+    } else if (strcmp(command, "PASV") == 0) {
+        int pasv_sock = create_pasv_socket(client);
+        if(pasv_sock < 0) {
+            const char *pasv_err = "425 Can't open data connection\r\n";
+            write(client->control_socket, pasv_err, strlen(pasv_err));
+        }
+        client->data_socket = pasv_sock;
+    } else if (strcmp(command, "QUIT") == 0) {
+        handle_quit(client);
     } else {
         const char *response = "Syntax error, command unrecognized\r\n";
         write(client->control_socket, response, strlen(response));
@@ -247,7 +254,7 @@ int main()
     address.sin_port = htons(CONTROL_PORT);
 
     if (bind(server_fd, (struct sockaddr *)&address, addr_len) < 0) {
-        perror("Bind failed");
+        perror("Bind failed in MAIN");
         exit(1);
     }
 
@@ -266,9 +273,8 @@ int main()
             continue;
         }
     
-        struct client_info client = {
+        client_info client = {
             .control_socket = client_socket,
-            .data_socket = 1,
             .is_authenticated = 0
         };
 
