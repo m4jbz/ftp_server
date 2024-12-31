@@ -55,6 +55,9 @@ void handle_quit(client_info *client)
         perror("Close failed");
         exit(1);
     }
+
+    client->data_socket = -1,
+    client->is_authenticated = 0;
 } 
 
 void handle_user(client_info *client, const char *username)
@@ -65,9 +68,7 @@ void handle_user(client_info *client, const char *username)
         write(client->control_socket, response, strlen(response));
 
         return;
-    }
-
-    // COPY THE USERNAME CONTENT INTO CLIENT->USERNAME VARIABLE,
+    } // COPY THE USERNAME CONTENT INTO CLIENT->USERNAME VARIABLE,
     // THE -1 AT THE END IS FOR THE \'0' CHARACTER
     stpncpy(client->username, username, sizeof(client->username) - 1);
     const char* response = "331 Username OK, password needed\r\n";
@@ -84,7 +85,6 @@ void handle_password(client_info *client, const char *password)
 
         return;
     }
-    
     // IF CREDENTIALS IS CORRECT AUTHENTICATE THE USER
     client->is_authenticated = 1;
     const char *response = "230 User logged in, proceed\r\n";
@@ -158,6 +158,100 @@ void handle_type(client_info *client, char *arg)
     }
 }
 
+void handle_stor(client_info *client, char *filename)
+{
+    FILE *file = NULL;
+    unsigned char *buffer = NULL;
+    int data_client = -1; // INIT SOCKET
+    size_t bytes_read;
+    ssize_t bytes_written;
+    off_t total_received = 0;
+
+    // CHECKS IF THE ARGS ARE CORRECT
+    if (!client || !filename) {
+        const char *err = "501 Syntax error in parameters or arguments\r\n";
+        write(client->control_socket, err, strlen(err));
+        return;
+    }
+
+    // CHECK IF WE HAVE A SOCKET FOR PASV
+    if (client->data_socket == -1) {
+        const char *msg = "425 Use PASV or PORT first\r\n";
+        write(client->control_socket, msg, strlen(msg));
+        return;
+    }
+
+    file = fopen(filename, "wb");
+    if (!file) {
+        const char *err = "551 Could not allocate memory\r\n";
+        write(client->control_socket, err, strlen(err));
+        fclose(file);
+        return;
+    }
+
+    buffer = malloc(FILE_SIZE);
+    if (!buffer) {
+        const char *err = "551 Local error: could not allocate memory\r\n";
+        write(client->control_socket, err, strlen(err));
+        return;
+    }
+
+    char response[256];
+    snprintf(response, sizeof(response), "150 Opening connection for %s\r\n", filename);
+
+    if (write(client->control_socket, response, strlen(response)) == -1) {
+        free(buffer);
+        fclose(file);
+        perror("Write failed in STOR");
+        return;
+    }
+
+    data_client = accept(client->data_socket, NULL, NULL);
+    if (data_client < 0) {
+        const char *err = "425 Can't open data connection\r\n";
+        write(client->control_socket, err, strlen(err));
+        free(buffer);
+        fclose(file);
+        return;
+    }
+
+    if (client->transfer_type == TYPE_I) {
+        int flag = 1;
+        setsockopt(data_client, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    }
+
+    while ((bytes_read = read(data_client, buffer, FILE_SIZE)) > 0) {
+        size_t bytes_remainning = bytes_read;
+        size_t bytes_written_total = 0;
+
+        while (bytes_remainning > 0) {
+            bytes_written = fwrite(buffer + bytes_written_total, 1, bytes_remainning, file);
+            if (bytes_written < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                perror("File write failed");
+                break;
+            }
+
+            bytes_remainning -= bytes_written;
+            bytes_written_total += bytes_written;
+            total_received += bytes_written;
+        }
+    }
+
+    free(buffer);
+    fclose(file);
+    close(data_client);
+    close(client->data_socket);
+    client->data_socket = -1;
+
+    snprintf(response, sizeof(response), 
+             "226 Transfer complete. %ld bytes received\r\n", 
+             (long)total_received);
+    write(client->control_socket, response, strlen(response));
+}
+
 void handle_retr(client_info *client, char *filename)
 {
     FILE *file = NULL;
@@ -210,7 +304,9 @@ void handle_retr(client_info *client, char *filename)
         const char *type_msg = "200 Switching to Binary mode for binary file\r\n";
         write(client->control_socket, type_msg, strlen(type_msg));
         client->transfer_type = TYPE_I;
-    } 
+    } else {
+        client->transfer_type = TYPE_A;
+    }
 
     // GET FILE INFORMATION
     if (stat(filename, &file_info) == 0) {
@@ -233,7 +329,7 @@ void handle_retr(client_info *client, char *filename)
     // ALLOCATE MEMORY FOR THE BUFFER
     buffer = malloc(FILE_SIZE);
     if (!buffer) {
-        const char *err = "551 Local erro: could not allocate memory\r\n";
+        const char *err = "551 Local error: could not allocate memory\r\n";
         write(client->control_socket, err, strlen(err));
         return;
     }
@@ -300,7 +396,7 @@ void handle_retr(client_info *client, char *filename)
 
     write(client->control_socket, response, strlen(response));
 
-    // CLEAN EVERYTHING
+    // CLEAN AND FREE EVERYTHING
     free(buffer);
     fclose(file);
     close(data_client);
@@ -344,14 +440,14 @@ void handle_list(client_info *client)
     DIR *dir;
     struct dirent *entry;
     char data_buffer[SIZE];
-    
+
     // CHECK IF WE HAVE A SOCKET FOR PASV
     if (client->data_socket == -1) {
         const char *response = "425 Use PASV or PORT first\r\n";
         write(client->control_socket, response, strlen(response));
         return;
     }
-    
+
     const char *response = "150 File status okay; about to open data connection.\r\n";
     if (write(client->control_socket, response, strlen(response)) == -1) {
         perror("Write failed in LIST");
@@ -447,7 +543,7 @@ void handle_command(client_info *client, char *buffer)
     } else if (strcmp(command, "PASS") == 0) {
         handle_password(client, arg);
     } else if (!client->is_authenticated) {
-        const char *response = "Not logged in\r\n";
+        const char *response = "530 Not logged in\r\n";
         write(client->control_socket, response, strlen(response));
     } else if(strcmp(command, "SYST") == 0) {
         // THIS IS NECESSARY FOR CURRENT FTP CLIENTS
@@ -470,6 +566,8 @@ void handle_command(client_info *client, char *buffer)
         client->data_socket = pasv_sock;
     } else if (strcmp(command, "RETR") == 0) {
         handle_retr(client, arg);
+    } else if (strcmp(command, "STOR") == 0) {
+        handle_stor(client, arg);
     } else if (strcmp(command, "QUIT") == 0) {
         handle_quit(client);
     } else {
@@ -521,7 +619,7 @@ int main()
             perror("Accept failed in MAIN");
             continue;
         }
-    
+
         // CREATE A NEW CLIENT AND INITIALIZE IT
         client_info client = {
             .control_socket = client_socket,
@@ -553,9 +651,22 @@ int main()
             // CHECK IF AN ERROR HAS OCURRED OR THE CLIENT HAS LEFT THE SERVER
             if (read_size < 0) {
                 printf("Client disconnected\n");
+                close(client_socket);
                 break;
             }
 
+            // CHECK FOR EMPTY OR WHITESPACE-ONLY BUFFER
+            int is_empty = 1;
+            for (int i = 0; buffer[i] != '\0'; i++) {
+                if (!isspace(buffer[i])) {
+                    is_empty = 0;
+                    break;
+                }
+            }
+
+            if (is_empty) {
+                continue;  // SKIP PROCESSING EMPTY COMMANDS
+            }
             // HANDLE THE INPUT (BUFFER)
             handle_command(&client, buffer);
         }
