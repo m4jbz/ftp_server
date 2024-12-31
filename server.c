@@ -18,6 +18,37 @@
 #define TYPE_I 1
 #define TYPE_A 0
 
+// FTP COMMANDS
+typedef enum {
+    USER,
+    PASS,
+    QUIT,
+    RETR,
+    STOR,
+    SYST,
+    LIST,
+    CWD,
+    PWD,
+    TYPE,
+    PASV,
+    UNKNOWN
+} ftp_commands;
+
+const char *ftp_commands_str[] = {
+    "USER",
+    "PASS",
+    "QUIT",
+    "RETR",
+    "STOR",
+    "SYST",
+    "LIST",
+    "CWD",
+    "PWD",
+    "TYPE",
+    "PASV",
+    "UNKNOWN"
+};
+
 // INFORMATION OF THE CLIENT
 typedef struct  {
     int is_authenticated;   // FOR CHECKING CREDENTIALS
@@ -518,6 +549,17 @@ void handle_list(client_info *client)
     }
 } 
 
+ftp_commands get_command(char command[32]) {
+    ftp_commands length = UNKNOWN;
+    for (int i = 0; i < (int)length; i++) {
+        if (strcmp(command, ftp_commands_str[i]) == 0) {
+            return (ftp_commands)i;
+        }
+    }
+
+    return UNKNOWN;
+}
+
 // THIS HANDLES EACH FTP COMMAND THAT WE ADD
 // BY NOW IT KINDA SUCKS THE WAY THAT I'M HANDLING
 // THIS BUT I'M GOING TO CHANGE IT
@@ -527,6 +569,8 @@ void handle_command(client_info *client, char *buffer)
     // ACTUAL COMMAND AND THE ARGUMENTS
     char command[32] = {0};
     char arg[SIZE] = {0};
+    int flag_login = 0;
+    const char *response;
 
     // CUT THE BUFFER SO IT HAS NO SPACES CHARACTERS
     trim(buffer);
@@ -540,41 +584,57 @@ void handle_command(client_info *client, char *buffer)
         command[i] = toupper(command[i]);
     }
 
-    // UGLY ASS HANDLING I KNOW
-    if (strcmp(command, "USER") == 0) {
-        handle_user(client, arg);
-    } else if (strcmp(command, "PASS") == 0) {
-        handle_password(client, arg);
-    } else if (!client->is_authenticated) {
+    // BUFFER COMMAND HANDLING
+    switch (get_command(command)) {
+        case USER:
+            handle_user(client, arg);
+            break;
+        case PASS:
+            handle_password(client, arg);
+            flag_login = 1;
+            break;
+        case QUIT:
+            handle_quit(client);
+            break;
+        case RETR:
+            handle_retr(client, arg);
+            break;
+        case STOR:
+            handle_stor(client, arg);
+            break;
+        case SYST:;
+            // THIS IS NECESSARY FOR CURRENT FTP CLIENTS
+            response = "215 UNIX Type: L8\r\n";
+            write(client->control_socket, response, strlen(response));
+            break;
+        case LIST:
+            handle_list(client);
+            break;
+        case CWD:
+            handle_cwd(client, arg);
+            break;
+        case PWD:
+            handle_pwd(client);
+            break;
+        case TYPE:
+            handle_type(client, arg);
+            break;
+        case PASV:;
+            int pasv_sock = create_pasv_socket(client);
+            if(pasv_sock < 0) {
+                const char *pasv_err = "425 Can't open data connection\r\n";
+                write(client->control_socket, pasv_err, strlen(pasv_err));
+            }
+            client->data_socket = pasv_sock;
+            break;
+        case UNKNOWN:;
+            response = "Syntax error, command unrecognized\r\n";
+            write(client->control_socket, response, strlen(response));
+    }
+
+    // CHECK CREDENTIALS
+    if (!client->is_authenticated && flag_login) {
         const char *response = "530 Not logged in\r\n";
-        write(client->control_socket, response, strlen(response));
-    } else if(strcmp(command, "SYST") == 0) {
-        // THIS IS NECESSARY FOR CURRENT FTP CLIENTS
-        const char *response = "215 UNIX Type: L8\r\n";
-        write(client->control_socket, response, strlen(response));
-    } else if (strcmp(command, "LIST") == 0) {
-        handle_list(client);
-    } else if (strcmp(command, "CWD") == 0) {
-        handle_cwd(client, arg);
-    } else if (strcmp(command, "PWD") == 0) {
-        handle_pwd(client);
-    } else if (strcmp(command, "TYPE") == 0) {
-        handle_type(client, arg);
-    } else if (strcmp(command, "PASV") == 0) {
-        int pasv_sock = create_pasv_socket(client);
-        if(pasv_sock < 0) {
-            const char *pasv_err = "425 Can't open data connection\r\n";
-            write(client->control_socket, pasv_err, strlen(pasv_err));
-        }
-        client->data_socket = pasv_sock;
-    } else if (strcmp(command, "RETR") == 0) {
-        handle_retr(client, arg);
-    } else if (strcmp(command, "STOR") == 0) {
-        handle_stor(client, arg);
-    } else if (strcmp(command, "QUIT") == 0) {
-        handle_quit(client);
-    } else {
-        const char *response = "Syntax error, command unrecognized\r\n";
         write(client->control_socket, response, strlen(response));
     }
 }
