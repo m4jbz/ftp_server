@@ -181,6 +181,7 @@ void handle_stor(client_info *client, char *filename)
         return;
     }
 
+    // OPEN FILE WITH WRITE PERMISSIONS AND BINARY MODE
     file = fopen(filename, "wb");
     if (!file) {
         const char *err = "551 Could not allocate memory\r\n";
@@ -198,7 +199,6 @@ void handle_stor(client_info *client, char *filename)
 
     char response[256];
     snprintf(response, sizeof(response), "150 Opening connection for %s\r\n", filename);
-
     if (write(client->control_socket, response, strlen(response)) == -1) {
         free(buffer);
         fclose(file);
@@ -215,11 +215,13 @@ void handle_stor(client_info *client, char *filename)
         return;
     }
 
+    // CHECKS IF IS A BINARY FILE
     if (client->transfer_type == TYPE_I) {
         int flag = 1;
         setsockopt(data_client, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
     }
 
+    // WRITE THE FILE TO THE SERVER
     while ((bytes_read = read(data_client, buffer, FILE_SIZE)) > 0) {
         size_t bytes_remainning = bytes_read;
         size_t bytes_written_total = 0;
@@ -240,6 +242,7 @@ void handle_stor(client_info *client, char *filename)
         }
     }
 
+    // FREE AND CLOSE EVERYTHING
     free(buffer);
     fclose(file);
     close(data_client);

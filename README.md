@@ -9,9 +9,9 @@ Simple FTP server, both written in C.
 + LIST all files in the directory given at line 170.
 + GET files from the server.
 + EXIT from the server.
++ PUT, upload files to the server.
 
 **Can NOT**:
-+ PUT, upload files to the server.
 + Handle more than one connection at a time.
 
 ## Compile and run:
@@ -28,3 +28,4 @@ make
 + [FTP Return Codes](https://en.wikipedia.org/wiki/List_of_FTP_server_return_codes)
 + [File Transfer using TCP socket in C by Idiot Developer](https://youtu.be/7d7_G81uews)
 + [Minimalist Web Server in C by Nir Litchman](https://www.youtube.com/watch?v=2HrYIl6GpYg)
++ [RFC 959: File Transfer Protocol](https://www.rfc-editor.org/rfc/rfc959)
